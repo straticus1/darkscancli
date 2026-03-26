@@ -6,7 +6,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
+
+	"github.com/afterdarktech/darkscan/pkg/archive"
+	"github.com/afterdarktech/darkscan/pkg/fsutil"
+	"github.com/afterdarktech/darkscan/pkg/vfs"
+	"github.com/afterdarktech/darkscan/pkg/worker"
 )
 
 type ScanResult struct {
@@ -32,14 +39,27 @@ type Engine interface {
 }
 
 type Scanner struct {
-	engines []Engine
-	mu      sync.RWMutex
+	engines          []Engine
+	mu               sync.RWMutex
+	archiveManager   *archive.Manager
+	passwordCallback func(path string) (string, error)
+	FS               vfs.FileSystem
 }
 
 func New() *Scanner {
+	am := archive.NewManager()
+	am.Register(&archive.ZipExtractor{})
+	am.Register(&archive.TarExtractor{})
+
 	return &Scanner{
-		engines: make([]Engine, 0),
+		engines:        make([]Engine, 0),
+		archiveManager: am,
+		FS:             nil, // By default initialized later or injected
 	}
+}
+
+func (s *Scanner) SetVFS(fs vfs.FileSystem) {
+	s.FS = fs
 }
 
 func (s *Scanner) RegisterEngine(engine Engine) {
@@ -48,42 +68,124 @@ func (s *Scanner) RegisterEngine(engine Engine) {
 	s.engines = append(s.engines, engine)
 }
 
-func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*ScanResult, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Scanner) SetPasswordCallback(cb func(path string) (string, error)) {
+	s.passwordCallback = cb
+}
 
-	if len(s.engines) == 0 {
-		return nil, fmt.Errorf("no scan engines registered")
+func (s *Scanner) acquireLocalFile(ctx context.Context, path string) (string, func(), error) {
+	if s.FS == nil {
+		return path, func() {}, nil
 	}
 
-	info, err := os.Stat(path)
+	f, err := s.FS.Open(path)
+	if err != nil {
+		return "", nil, err
+	}
+	defer f.Close()
+
+	if nameF, ok := f.(interface{ Name() string }); ok {
+		return nameF.Name(), func() {}, nil
+	}
+
+	tmp, err := os.CreateTemp("", "darkscan-vfs-*")
+	if err != nil {
+		return "", nil, err
+	}
+	if _, err := io.Copy(tmp, f); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", nil, err
+	}
+	tmp.Close()
+	return tmp.Name(), func() { os.Remove(tmp.Name()) }, nil
+}
+
+func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*ScanResult, error) {
+	var info os.FileInfo
+	var err error
+	if s.FS != nil {
+		info, err = s.FS.Stat(path)
+	} else {
+		info, err = os.Stat(path)
+	}
+	
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
 	if info.IsDir() {
-		return nil, fmt.Errorf("path is a directory, use ScanDirectory instead")
+		return nil, fmt.Errorf("path is a directory")
 	}
 
-	results := make([]*ScanResult, 0, len(s.engines))
-	for _, engine := range s.engines {
-		select {
-		case <-ctx.Done():
-			return results, ctx.Err()
-		default:
-			result, err := engine.Scan(ctx, path)
-			if err != nil {
-				results = append(results, &ScanResult{
-					FilePath:   path,
-					ScanEngine: engine.Name(),
-					Error:      err,
-				})
-				continue
+	return s.scanSingleTargetAndExtract(ctx, path)
+}
+
+func (s *Scanner) scanSingleTargetAndExtract(ctx context.Context, path string) ([]*ScanResult, error) {
+	var results []*ScanResult
+
+	localPath, cleanup, err := s.acquireLocalFile(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire VFS file locally: %w", err)
+	}
+	defer cleanup()
+
+	opts := archive.ExtractOptions{
+		InMemory:         true,
+		MaxMemoryMB:      50,
+		MaxFileSizeMB:    500,
+		PasswordCallback: s.passwordCallback,
+	}
+
+	extracted, extErr := s.archiveManager.Extract(ctx, localPath, opts)
+	if extErr == nil && len(extracted) > 0 {
+		for _, ex := range extracted {
+			if ex.IsMem {
+				memReader := strings.NewReader(string(ex.Content))
+				res, _ := s.ScanReader(ctx, memReader, path+"->"+ex.Name)
+				results = append(results, res...)
+			} else {
+				res, _ := s.scanSingleTargetAndExtract(ctx, ex.Path)
+				os.Remove(ex.Path)
+				for _, r := range res {
+					r.FilePath = path + "->" + ex.Name
+					results = append(results, r)
+				}
 			}
-			results = append(results, result)
+		}
+	} else {
+		for _, engine := range s.engines {
+			res, err := engine.Scan(ctx, localPath)
+			if err == nil && res != nil {
+				res.FilePath = path // Maintain original VFS path for reports
+				results = append(results, res)
+			}
+		}
+
+		var xattrs []string
+		var xerr error
+		if s.FS != nil {
+			xattrs, xerr = s.FS.ListXattrs(path)
+		} else {
+			xattrs, xerr = fsutil.ListXattrs(path)
+		}
+
+		if xerr == nil && len(xattrs) > 0 {
+			for _, attr := range xattrs {
+				var val []byte
+				if s.FS != nil {
+					val, err = s.FS.GetXattr(path, attr)
+				} else {
+					val, err = fsutil.GetXattr(path, attr)
+				}
+				if err == nil && len(val) > 0 {
+					memReader := strings.NewReader(string(val))
+					res, _ := s.ScanReader(ctx, memReader, path+"@"+attr)
+					results = append(results, res...)
+				}
+			}
 		}
 	}
-
+	
 	return results, nil
 }
 
@@ -96,39 +198,57 @@ func (s *Scanner) ScanDirectory(ctx context.Context, path string, recursive bool
 	}
 
 	var results []*ScanResult
-	var mu sync.Mutex
+	var resMu sync.Mutex
 
-	err := filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	numWorkers := runtime.NumCPU() * 2
+	pool := worker.NewPool(numWorkers, func(ctx context.Context, p string) (interface{}, error) {
+		return s.scanSingleTargetAndExtract(ctx, p)
+	})
 
-		if info.IsDir() {
-			if !recursive && p != path {
-				return filepath.SkipDir
-			}
-			return nil
-		}
+	pool.Start(ctx)
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			fileResults, err := s.scanFileInternal(ctx, p)
+	go func() {
+		walkFn := func(p string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			mu.Lock()
-			results = append(results, fileResults...)
-			mu.Unlock()
+
+			if info.IsDir() {
+				if !recursive && p != path {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			pool.Submit(worker.Job{Path: p, Priority: 1})
 			return nil
 		}
-	})
 
-	return results, err
+		if s.FS != nil {
+			_ = s.FS.Walk(path, walkFn)
+		} else {
+			_ = fsutil.Walk(path, walkFn)
+		}
+		pool.Wait()
+	}()
+
+	for res := range pool.Results() {
+		if res.Err != nil {
+			continue
+		}
+		if scanResults, ok := res.Value.([]*ScanResult); ok {
+			resMu.Lock()
+			results = append(results, scanResults...)
+			resMu.Unlock()
+		}
+	}
+	return results, nil
 }
 
 func (s *Scanner) scanFileInternal(ctx context.Context, path string) ([]*ScanResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	results := make([]*ScanResult, 0, len(s.engines))
 	for _, engine := range s.engines {
 		select {
@@ -166,7 +286,13 @@ func (s *Scanner) ScanReader(ctx context.Context, r io.Reader, name string) ([]*
 		return nil, fmt.Errorf("failed to close temp file: %w", err)
 	}
 
-	return s.ScanFile(ctx, tmpFile.Name())
+	results, err := s.scanFileInternal(ctx, tmpFile.Name())
+	if err == nil {
+		for _, res := range results {
+			res.FilePath = name
+		}
+	}
+	return results, err
 }
 
 func (s *Scanner) UpdateEngines(ctx context.Context) error {

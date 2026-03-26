@@ -1,3 +1,5 @@
+//go:build cgo
+
 package yara
 
 import (
@@ -126,7 +128,8 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 		Threats:    make([]scanner.Threat, 0),
 	}
 
-	matches, err := e.rules.ScanFile(path, 0, 0)
+	var matches yara.MatchRules
+	err := e.rules.ScanFile(path, 0, 0, &matches)
 	if err != nil {
 		return result, fmt.Errorf("scan error: %w", err)
 	}

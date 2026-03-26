@@ -45,6 +45,18 @@ build-static: deps
 	CGO_ENABLED=1 go build -ldflags="-s -w -extldflags=-static" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/darkscan
 	@echo "Static build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
+build-lib: deps
+	@echo "Building libdarkscan shared library..."
+	@mkdir -p $(BUILD_DIR)
+	go build -buildmode=c-shared -o $(BUILD_DIR)/libdarkscan.so ./darkscanlib
+	@echo "Shared library build complete"
+
+build-lib-windows: deps
+	@echo "Building libdarkscan.dll for Windows..."
+	@mkdir -p $(BUILD_DIR)
+	GOOS=windows GOARCH=amd64 go build -buildmode=c-shared -o $(BUILD_DIR)/libdarkscan.dll ./darkscanlib
+	@echo "Windows shared library build complete"
+
 install: build
 	@echo "Installing $(BINARY_NAME) to $(INSTALL_PATH)..."
 	@install -m 755 $(BUILD_DIR)/$(BINARY_NAME) $(INSTALL_PATH)/$(BINARY_NAME)

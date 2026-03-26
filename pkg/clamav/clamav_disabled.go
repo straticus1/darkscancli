@@ -1,5 +1,5 @@
-//go:build noclamav || windows
-// +build noclamav windows
+//go:build noclamav || windows || !cgo
+// +build noclamav windows !cgo
 
 package clamav
 

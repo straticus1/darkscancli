@@ -1,5 +1,5 @@
-//go:build !noclamav && !windows
-// +build !noclamav,!windows
+//go:build !noclamav && !windows && cgo
+// +build !noclamav,!windows,cgo
 
 package clamav
 
@@ -92,8 +92,8 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 
 	var virname *C.char
 	var scanned C.ulong
-
-	ret := C.cl_scanfile(pathC, &virname, &scanned, e.engine, C.CL_SCAN_STDOPT)
+	var opts C.struct_cl_scan_options
+	ret := C.cl_scanfile(pathC, &virname, &scanned, e.engine, &opts)
 
 	result := &scanner.ScanResult{
 		FilePath:   path,
