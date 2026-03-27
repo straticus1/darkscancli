@@ -113,6 +113,7 @@ func init() {
 	rootCmd.AddCommand(forensicsCmd)
 	rootCmd.AddCommand(profilesCmd)
 	rootCmd.AddCommand(identifyCmd)
+	rootCmd.AddCommand(privacyCmd)
 }
 
 func main() {
