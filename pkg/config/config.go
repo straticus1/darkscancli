@@ -15,12 +15,23 @@ type Config struct {
 	DarkAPI    DarkAPIConfig    `json:"darkapi"`
 	FileHashes FileHashesConfig `json:"filehashes"`
 	Scan       ScanConfig       `json:"scan"`
+	Daemon     DaemonConfig     `json:"daemon"`
+}
+
+type DaemonConfig struct {
+	DaemonEndpoint  string `json:"daemon_endpoint"`
+	AutoFallback    bool   `json:"auto_fallback"`
+	RequestTimeout  string `json:"request_timeout"`   // Default: "1h"
+	ConnectTimeout  string `json:"connect_timeout"`   // Default: "3s"
+	MaxUploadSizeMB int    `json:"max_upload_size_mb"` // Default: 500
 }
 
 type ClamAVConfig struct {
-	Enabled      bool   `json:"enabled"`
-	DatabasePath string `json:"database_path"`
-	AutoUpdate   bool   `json:"auto_update"`
+	Enabled        bool   `json:"enabled"`
+	DatabasePath   string `json:"database_path"`
+	AutoUpdate     bool   `json:"auto_update"`
+	MirrorURL      string `json:"mirror_url"`
+	UpdateInterval string `json:"update_interval"`
 }
 
 type YARAConfig struct {
@@ -74,9 +85,11 @@ type ScanConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		ClamAV: ClamAVConfig{
-			Enabled:      true,
-			DatabasePath: "/var/lib/clamav",
-			AutoUpdate:   false,
+			Enabled:        true,
+			DatabasePath:   "/var/lib/clamav",
+			AutoUpdate:     false,
+			MirrorURL:      "",
+			UpdateInterval: "4h",
 		},
 		YARA: YARAConfig{
 			Enabled:   false,
@@ -117,6 +130,13 @@ func DefaultConfig() *Config {
 			ExcludeExtensions: []string{},
 			IncludeExtensions: []string{},
 			Threads:           4,
+		},
+		Daemon: DaemonConfig{
+			DaemonEndpoint:  "",
+			AutoFallback:    true,
+			RequestTimeout:  "1h",
+			ConnectTimeout:  "3s",
+			MaxUploadSizeMB: 500,
 		},
 	}
 }

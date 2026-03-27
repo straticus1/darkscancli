@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/afterdarktech/darkscan/pkg/api/client"
 	"golang.org/x/term"
 
 	"github.com/afterdarktech/darkscan/pkg/capa"
@@ -81,6 +82,26 @@ var versionCmd = &cobra.Command{
 	Run:   runVersion,
 }
 
+var daemonCmd = &cobra.Command{
+	Use:   "daemon",
+	Short: "Manage DarkScan daemon",
+	Long:  "Commands for managing the DarkScan daemon service",
+}
+
+var daemonStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Get daemon status",
+	Long:  "Retrieve status information from the running DarkScan daemon",
+	RunE:  runDaemonStatus,
+}
+
+var daemonUpdateCmd = &cobra.Command{
+	Use:   "update",
+	Short: "Update daemon engines",
+	Long:  "Trigger manual update of scanning engines in the DarkScan daemon",
+	RunE:  runDaemonUpdate,
+}
+
 func init() {
 	defaultConfigPath, _ := config.GetDefaultConfigPath()
 
@@ -101,6 +122,9 @@ func init() {
 	scanCmd.Flags().StringVar(&yaraRulesPath, "yara-rules", "", "Path to YARA rules")
 	scanCmd.Flags().StringVar(&capaRulesPath, "capa-rules", "", "Path to CAPA rules")
 
+	daemonCmd.AddCommand(daemonStatusCmd)
+	daemonCmd.AddCommand(daemonUpdateCmd)
+
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(updateCmd)
@@ -114,6 +138,7 @@ func init() {
 	rootCmd.AddCommand(profilesCmd)
 	rootCmd.AddCommand(identifyCmd)
 	rootCmd.AddCommand(privacyCmd)
+	rootCmd.AddCommand(daemonCmd)
 }
 
 func main() {
@@ -178,6 +203,47 @@ func runScan(cmd *cobra.Command, args []string) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Try Daemon Connection
+	daemonURL := ""
+	if cfg.Daemon.DaemonEndpoint != "" {
+		daemonURL = cfg.Daemon.DaemonEndpoint
+	}
+
+	// Parse timeouts from config
+	requestTimeout, err := time.ParseDuration(cfg.Daemon.RequestTimeout)
+	if err != nil {
+		requestTimeout = 1 * time.Hour
+	}
+	connectTimeout, err := time.ParseDuration(cfg.Daemon.ConnectTimeout)
+	if err != nil {
+		connectTimeout = 3 * time.Second
+	}
+
+	dsClient, daemonErr := client.NewClient(daemonURL, "", requestTimeout, connectTimeout)
+	if daemonErr == nil && dsClient != nil {
+		if verbose {
+			fmt.Println("Connected to DarkScan daemon, routing scan request...")
+		}
+		
+		scanStart := time.Now()
+		
+		// If it's a remote URL like S3, might want to stream it, but for MVP we send Path
+		// A fully robust implementation would parse s3:// and stream the bytes, or rely on daemon to mount it
+		results, err := dsClient.ScanLocal(path, recursive)
+		if err != nil {
+			return fmt.Errorf("scan failed via daemon: %w", err)
+		}
+		
+		printResults(results, time.Since(scanStart))
+		return nil
+	} else if !cfg.Daemon.AutoFallback {
+		return fmt.Errorf("daemon not found and auto_fallback is disabled: %v", daemonErr)
+	}
+
+	if verbose {
+		fmt.Printf("Daemon connect failed (%v), falling back to standalone engine initialization...\n", daemonErr)
 	}
 
 	s := scanner.New()
@@ -648,4 +714,84 @@ func printJSONResults(results []*scanner.ScanResult, duration time.Duration) {
 	}
 
 	fmt.Println(string(jsonData))
+}
+
+func runDaemonStatus(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Parse timeouts from config
+	requestTimeout, err := time.ParseDuration(cfg.Daemon.RequestTimeout)
+	if err != nil {
+		requestTimeout = 1 * time.Hour
+	}
+	connectTimeout, err := time.ParseDuration(cfg.Daemon.ConnectTimeout)
+	if err != nil {
+		connectTimeout = 3 * time.Second
+	}
+
+	dsClient, err := client.NewClient(cfg.Daemon.DaemonEndpoint, "", requestTimeout, connectTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to connect to daemon: %w", err)
+	}
+
+	status, err := dsClient.GetStatus()
+	if err != nil {
+		return fmt.Errorf("failed to get status: %w", err)
+	}
+
+	// Pretty print the status
+	fmt.Printf("Daemon Status: %s\n", status.Status)
+	fmt.Printf("Version: %s\n", status.Version)
+	fmt.Printf("Uptime: %s\n", status.Uptime)
+	fmt.Printf("\nEngines:\n")
+	for _, engine := range status.Engines {
+		fmt.Printf("  - %s: ", engine.Name)
+		if engine.Enabled {
+			fmt.Printf("enabled")
+			if engine.Version != "" {
+				fmt.Printf(" (version: %s)", engine.Version)
+			}
+			if engine.LastUpdate != "" {
+				fmt.Printf(" [last update: %s]", engine.LastUpdate)
+			}
+			fmt.Println()
+		} else {
+			fmt.Println("disabled")
+		}
+	}
+
+	return nil
+}
+
+func runDaemonUpdate(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Parse timeouts from config
+	requestTimeout, err := time.ParseDuration(cfg.Daemon.RequestTimeout)
+	if err != nil {
+		requestTimeout = 1 * time.Hour
+	}
+	connectTimeout, err := time.ParseDuration(cfg.Daemon.ConnectTimeout)
+	if err != nil {
+		connectTimeout = 3 * time.Second
+	}
+
+	dsClient, err := client.NewClient(cfg.Daemon.DaemonEndpoint, "", requestTimeout, connectTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to connect to daemon: %w", err)
+	}
+
+	fmt.Println("Triggering daemon engine update...")
+	if err := dsClient.TriggerUpdate(); err != nil {
+		return fmt.Errorf("update failed: %w", err)
+	}
+
+	fmt.Println("Engines updated successfully")
+	return nil
 }

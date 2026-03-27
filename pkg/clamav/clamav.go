@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/afterdarktech/darkscan/pkg/scanner"
@@ -23,6 +25,7 @@ type Engine struct {
 	engine      *C.struct_cl_engine
 	dbPath      string
 	initialized bool
+	mu          sync.RWMutex
 }
 
 func New(dbPath string) (*Engine, error) {
@@ -90,10 +93,14 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 	pathC := C.CString(path)
 	defer C.free(unsafe.Pointer(pathC))
 
+	e.mu.RLock()
+	eng := e.engine
+	e.mu.RUnlock()
+
 	var virname *C.char
 	var scanned C.ulong
 	var opts C.struct_cl_scan_options
-	ret := C.cl_scanfile(pathC, &virname, &scanned, e.engine, &opts)
+	ret := C.cl_scanfile(pathC, &virname, &scanned, eng, &opts)
 
 	result := &scanner.ScanResult{
 		FilePath:   path,
@@ -120,15 +127,47 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 }
 
 func (e *Engine) Update(ctx context.Context) error {
-	freshclamPath := "/usr/bin/freshclam"
-	if _, err := os.Stat(freshclamPath); os.IsNotExist(err) {
-		freshclamPath = "/usr/local/bin/freshclam"
-		if _, err := os.Stat(freshclamPath); os.IsNotExist(err) {
-			return fmt.Errorf("freshclam not found")
-		}
+	if e.dbPath == "" {
+		return fmt.Errorf("engine has no database path configured")
 	}
 
-	return fmt.Errorf("automated updates not implemented - run 'freshclam' manually to update virus definitions")
+	newEngine := C.cl_engine_new()
+	if newEngine == nil {
+		return fmt.Errorf("failed to create new ClamAV engine for reload")
+	}
+
+	dbPathC := C.CString(e.dbPath)
+	defer C.free(unsafe.Pointer(dbPathC))
+
+	var signo C.uint
+	ret := C.cl_load(dbPathC, newEngine, &signo, C.CL_DB_STDOPT)
+	if ret != C.CL_SUCCESS {
+		C.cl_engine_free(newEngine)
+		return fmt.Errorf("failed to load database during reload: %s", C.GoString(C.cl_strerror(ret)))
+	}
+
+	ret = C.cl_engine_compile(newEngine)
+	if ret != C.CL_SUCCESS {
+		C.cl_engine_free(newEngine)
+		return fmt.Errorf("failed to compile engine during reload: %s", C.GoString(C.cl_strerror(ret)))
+	}
+
+	e.mu.Lock()
+	oldEngine := e.engine
+	e.engine = newEngine
+	e.mu.Unlock()
+
+	// Defer freeing the old engine until active scans are likely finished
+	// Using a conservative 10-minute grace period to prevent crashes from long-running scans
+	// TODO: Implement proper reference counting for production use
+	go func() {
+		time.Sleep(10 * time.Minute)
+		if oldEngine != nil {
+			C.cl_engine_free(oldEngine)
+		}
+	}()
+
+	return nil
 }
 
 func (e *Engine) Close() error {
