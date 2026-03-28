@@ -103,7 +103,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 
 	// Open source
-	partition, err := local.NewLocalPartition(source)
+	partition, err := local.NewPartition(source)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
@@ -223,6 +223,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	outputDir := args[1]
 
 	fmt.Printf("Recovering files from report: %s\n", reportPath)
+	fmt.Printf("Output directory: %s\n", outputDir)
 
 	// TODO: Implement DFXML report parsing and recovery
 	// This would read the DFXML report and extract files based on byte runs
@@ -259,6 +260,8 @@ func listFormats(cmd *cobra.Command, args []string) error {
 
 func showStats(cmd *cobra.Command, args []string) error {
 	reportPath := args[0]
+
+	fmt.Printf("Loading statistics from: %s\n", reportPath)
 
 	// TODO: Parse DFXML report and show statistics
 	// This would read the report and display detailed statistics

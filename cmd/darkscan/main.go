@@ -50,6 +50,7 @@ var (
 	autoQuarantine    bool
 	yaraRulesPath     string
 	capaRulesPath     string
+	progressMode      bool
 )
 
 var rootCmd = &cobra.Command{
@@ -125,6 +126,7 @@ func init() {
 	scanCmd.Flags().BoolVarP(&autoQuarantine, "quarantine", "q", false, "Automatically quarantine infected files")
 	scanCmd.Flags().StringVar(&yaraRulesPath, "yara-rules", "", "Path to YARA rules")
 	scanCmd.Flags().StringVar(&capaRulesPath, "capa-rules", "", "Path to CAPA rules")
+	scanCmd.Flags().BoolVar(&progressMode, "progress", false, "Output JSON progress events to stderr for GUI integration")
 
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonUpdateCmd)
