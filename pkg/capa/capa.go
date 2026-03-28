@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 
@@ -127,6 +128,10 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 	}
 
 	return result, nil
+}
+
+func (e *Engine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
+	return scanner.ScanReaderToTemp(ctx, r, name, e.Scan)
 }
 
 func (e *Engine) determineSeverity(rule CapaRule) string {

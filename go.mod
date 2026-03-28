@@ -8,6 +8,7 @@ require (
 	github.com/hillu/go-yara/v4 v4.3.2
 	github.com/mattn/go-sqlite3 v1.14.37
 	github.com/spf13/cobra v1.8.0
+	github.com/unicorn-engine/unicorn v0.0.0-20260217064959-7c5db94191de
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b
 	github.com/yeka/zip v0.0.0-20231116150916-03d6312748a9
 	golang.org/x/sys v0.42.0

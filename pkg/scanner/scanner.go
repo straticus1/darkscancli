@@ -1,9 +1,11 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,12 +36,36 @@ type Threat struct {
 type Engine interface {
 	Name() string
 	Scan(ctx context.Context, path string) (*ScanResult, error)
+	ScanReader(ctx context.Context, r io.Reader, name string) (*ScanResult, error)
 	Update(ctx context.Context) error
 	Close() error
 }
 
+// ScanReaderToTemp is a helper for engines that do not natively support stream scanning.
+// It writes the reader to a temporary file, calls the provided scanFn, and cleans up.
+func ScanReaderToTemp(ctx context.Context, r io.Reader, name string, scanFn func(ctx context.Context, path string) (*ScanResult, error)) (*ScanResult, error) {
+	tmpFile, err := os.CreateTemp("", "darkscan-helper-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := io.Copy(tmpFile, r); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write to temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	res, err := scanFn(ctx, tmpFile.Name())
+	if res != nil {
+		res.FilePath = name
+	}
+	return res, err
+}
+
 type Scanner struct {
 	engines          []Engine
+	middlewares      []Middleware
 	mu               sync.RWMutex
 	archiveManager   *archive.Manager
 	passwordCallback func(path string) (string, error)
@@ -70,6 +96,7 @@ func (s *Scanner) WithVFS(fs vfs.FileSystem) *Scanner {
 	defer s.mu.RUnlock()
 	return &Scanner{
 		engines:          s.engines,
+		middlewares:      s.middlewares,
 		archiveManager:   s.archiveManager,
 		passwordCallback: s.passwordCallback,
 		FS:               fs,
@@ -80,6 +107,12 @@ func (s *Scanner) RegisterEngine(engine Engine) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.engines = append(s.engines, engine)
+}
+
+func (s *Scanner) RegisterMiddleware(m Middleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.middlewares = append(s.middlewares, m)
 }
 
 func (s *Scanner) SetPasswordCallback(cb func(path string) (string, error)) {
@@ -135,6 +168,28 @@ func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*ScanResult, err
 }
 
 func (s *Scanner) scanSingleTargetAndExtract(ctx context.Context, path string) ([]*ScanResult, error) {
+	// Apply PreScan middlewares
+	s.mu.RLock()
+	var preRes []*ScanResult
+	var skip bool
+	for _, m := range s.middlewares {
+		res, err := m.PreScan(ctx, path)
+		if err != nil {
+			s.mu.RUnlock()
+			return nil, err
+		}
+		if res != nil {
+			preRes = res
+			skip = true
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if skip {
+		return preRes, nil
+	}
+
 	var results []*ScanResult
 
 	localPath, cleanup, err := s.acquireLocalFile(ctx, path)
@@ -200,6 +255,15 @@ func (s *Scanner) scanSingleTargetAndExtract(ctx context.Context, path string) (
 		}
 	}
 	
+	// Apply PostScan middlewares
+	s.mu.RLock()
+	for _, m := range s.middlewares {
+		if err := m.PostScan(ctx, path, results); err != nil {
+			log.Printf("PostScan middleware error for %s: %v", path, err)
+		}
+	}
+	s.mu.RUnlock()
+
 	return results, nil
 }
 
@@ -285,28 +349,68 @@ func (s *Scanner) scanFileInternal(ctx context.Context, path string) ([]*ScanRes
 }
 
 func (s *Scanner) ScanReader(ctx context.Context, r io.Reader, name string) ([]*ScanResult, error) {
-	tmpFile, err := os.CreateTemp("", "darkscan-*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
-	if _, err := io.Copy(tmpFile, r); err != nil {
-		return nil, fmt.Errorf("failed to write to temp file: %w", err)
-	}
-
-	if err := tmpFile.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	results, err := s.scanFileInternal(ctx, tmpFile.Name())
-	if err == nil {
-		for _, res := range results {
-			res.FilePath = name
+	// Apply PreScan middlewares
+	s.mu.RLock()
+	var preRes []*ScanResult
+	var skip bool
+	for _, m := range s.middlewares {
+		res, err := m.PreScan(ctx, name)
+		if err != nil {
+			s.mu.RUnlock()
+			return nil, err
+		}
+		if res != nil {
+			preRes = res
+			skip = true
+			break
 		}
 	}
-	return results, err
+	s.mu.RUnlock()
+
+	if skip {
+		return preRes, nil
+	}
+
+	// Read into memory to support multiple engines reading the stream
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read stream into memory: %w", err)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	results := make([]*ScanResult, 0, len(s.engines))
+	for _, engine := range s.engines {
+		select {
+		case <-ctx.Done():
+			return results, ctx.Err()
+		default:
+			// Create a new reader from the buffer for each engine
+			engineReader := bytes.NewReader(buf)
+			result, err := engine.ScanReader(ctx, engineReader, name)
+			if err != nil {
+				results = append(results, &ScanResult{
+					FilePath:   name,
+					ScanEngine: engine.Name(),
+					Error:      err,
+				})
+				continue
+			}
+			if result != nil {
+				results = append(results, result)
+			}
+		}
+	}
+
+	// Apply PostScan middlewares
+	for _, m := range s.middlewares {
+		if err := m.PostScan(ctx, name, results); err != nil {
+			log.Printf("PostScan middleware error for %s: %v", name, err)
+		}
+	}
+
+	return results, nil
 }
 
 func (s *Scanner) UpdateEngines(ctx context.Context) error {

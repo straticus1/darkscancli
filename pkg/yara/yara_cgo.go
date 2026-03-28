@@ -5,6 +5,7 @@ package yara
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,6 +150,66 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 			description := fmt.Sprintf("YARA rule matched: %s", match.Rule)
 			if match.Namespace != "" {
 				description = fmt.Sprintf("YARA rule matched: %s (namespace: %s)", match.Rule, match.Namespace)
+			}
+
+			result.Threats = append(result.Threats, scanner.Threat{
+				Name:        match.Rule,
+				Severity:    severity,
+				Description: description,
+				Engine:      "YARA",
+			})
+		}
+	}
+
+	return result, nil
+}
+
+func (e *Engine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
+	if !e.initialized {
+		return nil, fmt.Errorf("engine not initialized")
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	result := &scanner.ScanResult{
+		FilePath:   name,
+		ScanEngine: "YARA",
+		Infected:   false,
+		Threats:    make([]scanner.Threat, 0),
+	}
+
+	// Read all into memory for YARA ScanMem
+	// Optimization limit: limit to reasonably sized files or handle carefully
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return result, fmt.Errorf("read error: %w", err)
+	}
+
+	var matches yara.MatchRules
+	err = e.rules.ScanMem(buf, 0, 0, &matches)
+	if err != nil {
+		return result, fmt.Errorf("scan error: %w", err)
+	}
+
+	if len(matches) > 0 {
+		result.Infected = true
+		for _, match := range matches {
+			severity := "medium"
+			if strings.Contains(strings.ToLower(match.Rule), "malware") ||
+				strings.Contains(strings.ToLower(match.Rule), "trojan") ||
+				strings.Contains(strings.ToLower(match.Rule), "ransomware") {
+				severity = "high"
+			} else if strings.Contains(strings.ToLower(match.Rule), "suspicious") {
+				severity = "low"
+			}
+
+			description := fmt.Sprintf("YARA rule matched in stream: %s", match.Rule)
+			if match.Namespace != "" {
+				description = fmt.Sprintf("YARA rule matched in stream: %s (namespace: %s)", match.Rule, match.Namespace)
 			}
 
 			result.Threats = append(result.Threats, scanner.Threat{

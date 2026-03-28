@@ -56,7 +56,7 @@ func scanDirectory(ctx context.Context, scnr *scanner.Scanner, path string) []*s
 			log.Printf("Error scanning %s: %v", file, err)
 			continue
 		}
-		results = append(results, result)
+		results = append(results, result...)
 	}
 
 	return results

@@ -21,6 +21,7 @@ vendor/
 darkscan
 dist/
 build/
+bin/
 
 # IDE
 .vscode/

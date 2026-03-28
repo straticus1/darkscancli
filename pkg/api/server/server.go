@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,11 +10,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/afterdarksys/darkscan/pkg/scanner"
+	"github.com/afterdarksys/darkscan/pkg/stego"
+	"github.com/afterdarksys/darkscan/pkg/store"
 	"github.com/afterdarksys/darkscan/pkg/vfs/local"
 	"github.com/afterdarksys/darkscan/pkg/vfs/nfs"
 	"github.com/afterdarksys/darkscan/pkg/vfs/ntfs"
@@ -31,6 +35,9 @@ type Server struct {
 	doneChan        chan struct{}
 	maxUploadBytes  int64
 	startTime       time.Time
+	store           *store.Store
+	authToken       string
+	scanRoot        string
 }
 
 func NewServer(s *scanner.Scanner, listenAddr, unixSocket string, maxUploadMB int) *Server {
@@ -48,13 +55,57 @@ func NewServer(s *scanner.Scanner, listenAddr, unixSocket string, maxUploadMB in
 	}
 }
 
+// WithStore assigns a scanner store to the server
+func (s *Server) WithStore(st *store.Store) *Server {
+	s.store = st
+	return s
+}
+
+// WithAuthToken secures the server API with a bearer token
+func (s *Server) WithAuthToken(token string) *Server {
+	s.authToken = token
+	return s
+}
+
+// WithScanRoot restricts /scan/local to a specific directory branch
+func (s *Server) WithScanRoot(root string) *Server {
+	s.scanRoot = root
+	return s
+}
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.authToken == "" {
+			next(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			s.sendError(w, "Unauthorized: missing or invalid authorization header", http.StatusUnauthorized)
+			return
+		}
+
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) != 1 {
+			s.sendError(w, "Unauthorized: invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", s.handlePing)
-	mux.HandleFunc("/status", s.handleStatus)
-	mux.HandleFunc("/update", s.handleUpdate)
-	mux.HandleFunc("/scan/local", s.handleScanLocal)
-	mux.HandleFunc("/scan/stream", s.handleScanStream)
+	mux.HandleFunc("/status", s.requireAuth(s.handleStatus))
+	mux.HandleFunc("/update", s.requireAuth(s.handleUpdate))
+	mux.HandleFunc("/scan/local", s.requireAuth(s.handleScanLocal))
+	mux.HandleFunc("/scan/stream", s.requireAuth(s.handleScanStream))
+	mux.HandleFunc("/stego/analyze", s.requireAuth(s.handleStegoAnalyze))
+	mux.HandleFunc("/hashstore/check", s.requireAuth(s.handleHashCheck))
+	mux.HandleFunc("/hashstore/update", s.requireAuth(s.handleHashUpdate))
 
 	s.httpServer = &http.Server{
 		Handler: mux,
@@ -165,6 +216,36 @@ type UpdateResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type StegoAnalyzeRequest struct {
+	Path string `json:"path"`
+}
+
+type StegoAnalyzeResponse struct {
+	Success  bool            `json:"success"`
+	Error    string          `json:"error,omitempty"`
+	Analysis *stego.Analysis `json:"analysis,omitempty"`
+}
+
+type HashCheckRequest struct {
+	SHA256 string `json:"sha256"`
+}
+
+type HashCheckResponse struct {
+	Success bool                  `json:"success"`
+	Error   string                `json:"error,omitempty"`
+	Found   bool                  `json:"found"`
+	Entry   *store.HashCacheEntry `json:"entry,omitempty"`
+}
+
+type HashUpdateRequest struct {
+	Entry store.HashCacheEntry `json:"entry"`
+}
+
+type HashUpdateResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
@@ -244,6 +325,27 @@ func (s *Server) handleScanLocal(w http.ResponseWriter, r *http.Request) {
 	if req.Path == "" {
 		s.sendError(w, "Path is required", http.StatusBadRequest)
 		return
+	}
+
+	if s.scanRoot != "" && !strings.HasPrefix(req.Path, "s3://") && !strings.HasPrefix(req.Path, "nfs://") && !strings.HasPrefix(req.Path, "ntfs://") {
+		absPath, err := filepath.EvalSymlinks(req.Path)
+		if err != nil {
+			s.sendError(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		absRoot, err := filepath.EvalSymlinks(s.scanRoot)
+		if err != nil {
+			s.sendError(w, "Server configuration error: invalid scan root", http.StatusInternalServerError)
+			return
+		}
+
+		if !strings.HasPrefix(absPath, absRoot+string(filepath.Separator)) && absPath != absRoot {
+			s.sendError(w, "Access Denied: Path outside allowed scan root", http.StatusForbidden)
+			return
+		}
+
+		req.Path = absPath
 	}
 
 	log.Printf("Performing local scan of path: %s (recursive: %v)", req.Path, req.Recursive)
@@ -382,6 +484,129 @@ func (s *Server) handleScanStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sendResponse(w, results, time.Since(start))
+}
+
+func (s *Server) handleStegoAnalyze(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req StegoAnalyzeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(StegoAnalyzeResponse{Success: false, Error: "Invalid JSON payload"})
+		return
+	}
+
+	if req.Path == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(StegoAnalyzeResponse{Success: false, Error: "Path is required"})
+		return
+	}
+
+	// Apply scanRoot restriction for local paths
+	if s.scanRoot != "" && !strings.HasPrefix(req.Path, "s3://") && !strings.HasPrefix(req.Path, "nfs://") && !strings.HasPrefix(req.Path, "ntfs://") {
+		absPath, err := filepath.EvalSymlinks(req.Path)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(StegoAnalyzeResponse{Success: false, Error: "Invalid path"})
+			return
+		}
+
+		absRoot, err := filepath.EvalSymlinks(s.scanRoot)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(StegoAnalyzeResponse{Success: false, Error: "Server configuration error"})
+			return
+		}
+
+		if !strings.HasPrefix(absPath, absRoot+string(filepath.Separator)) && absPath != absRoot {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(StegoAnalyzeResponse{Success: false, Error: "Access Denied: Path outside allowed scan root"})
+			return
+		}
+
+		req.Path = absPath
+	}
+
+	analyzer := stego.NewAnalyzer()
+	analysis, err := analyzer.AnalyzeFile(req.Path)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(StegoAnalyzeResponse{Success: false, Error: err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(StegoAnalyzeResponse{
+		Success:  true,
+		Analysis: analysis,
+	}); err != nil {
+		log.Printf("Failed to encode stego response: %v", err)
+	}
+}
+
+func (s *Server) handleHashCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.store == nil {
+		s.sendError(w, "HashStore is not configured on this daemon", http.StatusNotImplemented)
+		return
+	}
+
+	var req HashCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(HashCheckResponse{Success: false, Error: "Invalid JSON payload"})
+		return
+	}
+
+	entry, found := s.store.CheckHashCache(req.SHA256)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(HashCheckResponse{
+		Success: true,
+		Found:   found,
+		Entry:   entry,
+	}); err != nil {
+		log.Printf("Failed to encode hash check response: %v", err)
+	}
+}
+
+func (s *Server) handleHashUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.store == nil {
+		s.sendError(w, "HashStore is not configured on this daemon", http.StatusNotImplemented)
+		return
+	}
+
+	var req HashUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(HashUpdateResponse{Success: false, Error: "Invalid JSON payload"})
+		return
+	}
+
+	if err := s.store.UpdateHashCache(req.Entry); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(HashUpdateResponse{Success: false, Error: err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(HashUpdateResponse{
+		Success: true,
+	}); err != nil {
+		log.Printf("Failed to encode hash update response: %v", err)
+	}
 }
 
 func (s *Server) sendError(w http.ResponseWriter, msg string, code int) {

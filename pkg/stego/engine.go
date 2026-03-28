@@ -3,8 +3,11 @@ package stego
 import (
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
+
+	"github.com/afterdarksys/darkscan/pkg/scanner"
 )
 
 // Engine implements scanner.Engine interface for steganography detection
@@ -40,14 +43,14 @@ func (e *Engine) Name() string {
 }
 
 // Scan scans a file for steganography
-func (e *Engine) Scan(ctx context.Context, path string) (*ScanResult, error) {
+func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, error) {
 	// Quick check: only scan images
 	ext := strings.ToLower(filepath.Ext(path))
 	if !e.imageExts[ext] {
-		return &ScanResult{
+		return &scanner.ScanResult{
 			FilePath:   path,
 			Infected:   false,
-			Threats:    []Threat{},
+			Threats:    []scanner.Threat{},
 			ScanEngine: e.Name(),
 		}, nil
 	}
@@ -62,19 +65,19 @@ func (e *Engine) Scan(ctx context.Context, path string) (*ScanResult, error) {
 	// Analyze file
 	analysis, err := e.analyzer.AnalyzeFile(path)
 	if err != nil {
-		return &ScanResult{
+		return &scanner.ScanResult{
 			FilePath:   path,
 			Infected:   false,
-			Threats:    []Threat{},
+			Threats:    []scanner.Threat{},
 			ScanEngine: e.Name(),
 			Error:      err,
 		}, nil // Don't fail scan if stego check fails
 	}
 
-	result := &ScanResult{
+	result := &scanner.ScanResult{
 		FilePath:   path,
 		Infected:   false,
-		Threats:    []Threat{},
+		Threats:    []scanner.Threat{},
 		ScanEngine: e.Name(),
 	}
 
@@ -84,46 +87,42 @@ func (e *Engine) Scan(ctx context.Context, path string) (*ScanResult, error) {
 
 		// Create threats from indicators
 		for _, indicator := range analysis.Indicators {
-			threat := Threat{
+			threat := scanner.Threat{
 				Name:        fmt.Sprintf("STEGO.%s", strings.ToUpper(indicator.Type)),
 				Severity:    indicator.Severity,
-				Description: indicator.Description,
+				Description: fmt.Sprintf("%s (Confidence: %d)", indicator.Description, indicator.Confidence),
 				Engine:      e.Name(),
-				Confidence:  indicator.Confidence,
-				Details:     indicator.Details,
 			}
 			result.Threats = append(result.Threats, threat)
 		}
 
 		// Add detected tool signatures as threats
 		for _, sig := range analysis.Signatures {
-			threat := Threat{
+			threat := scanner.Threat{
 				Name:        fmt.Sprintf("STEGO.Tool.%s", strings.ReplaceAll(sig.Tool, " ", "")),
 				Severity:    "high",
-				Description: sig.Description,
+				Description: fmt.Sprintf("%s (Confidence: %d, Tool: %s)", sig.Description, sig.Confidence, sig.Tool),
 				Engine:      e.Name(),
-				Confidence:  sig.Confidence,
-				Details: map[string]interface{}{
-					"tool":    sig.Tool,
-					"version": sig.Version,
-				},
 			}
 			result.Threats = append(result.Threats, threat)
 		}
 
 		// If no specific threats but overall suspicious, add generic threat
 		if len(result.Threats) == 0 {
-			result.Threats = append(result.Threats, Threat{
+			result.Threats = append(result.Threats, scanner.Threat{
 				Name:        "STEGO.Generic",
 				Severity:    "medium",
 				Description: fmt.Sprintf("Steganography detected with %d%% confidence", analysis.Confidence),
 				Engine:      e.Name(),
-				Confidence:  analysis.Confidence,
 			})
 		}
 	}
 
 	return result, nil
+}
+
+func (e *Engine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
+	return scanner.ScanReaderToTemp(ctx, r, name, e.Scan)
 }
 
 // Update updates steganography signatures (no-op for now)
@@ -137,21 +136,4 @@ func (e *Engine) Close() error {
 	return nil
 }
 
-// ScanResult matches scanner.ScanResult
-type ScanResult struct {
-	FilePath   string
-	Infected   bool
-	Threats    []Threat
-	ScanEngine string
-	Error      error
-}
 
-// Threat matches scanner.Threat with additional stego-specific fields
-type Threat struct {
-	Name        string
-	Severity    string
-	Description string
-	Engine      string
-	Confidence  int
-	Details     map[string]interface{}
-}

@@ -16,6 +16,7 @@ import (
 	"github.com/afterdarksys/darkscan/pkg/document"
 	"github.com/afterdarksys/darkscan/pkg/heuristics"
 	"github.com/afterdarksys/darkscan/pkg/license"
+	"github.com/afterdarksys/darkscan/pkg/sandbox"
 	"github.com/afterdarksys/darkscan/pkg/scanner"
 	"github.com/afterdarksys/darkscan/pkg/yara"
 	"github.com/spf13/cobra"
@@ -166,10 +167,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 	s.RegisterEngine(heuristicsEngine)
 	defer heuristicsEngine.Close()
 
+	// Sandbox
+	if cfg.Sandbox.Enabled {
+		sandboxEngine := sandbox.New()
+		s.RegisterEngine(sandboxEngine)
+		defer sandboxEngine.Close()
+	}
+
 	log.Println("Scanning engines initialized and loaded into memory.")
 
 	// Start server
 	srv := server.NewServer(s, listenAddr, unixSocket, cfg.Daemon.MaxUploadSizeMB)
+	if cfg.Daemon.DaemonToken != "" {
+		srv = srv.WithAuthToken(cfg.Daemon.DaemonToken)
+	}
 
 	errChan := make(chan error, 1)
 	go func() {

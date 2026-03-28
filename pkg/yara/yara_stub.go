@@ -5,6 +5,8 @@ package yara
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/afterdarksys/darkscan/pkg/scanner"
 )
 
@@ -21,6 +23,10 @@ func (e *Engine) Name() string {
 }
 
 func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, error) {
+	return nil, fmt.Errorf("YARA is not supported")
+}
+
+func (e *Engine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
 	return nil, fmt.Errorf("YARA is not supported")
 }
 

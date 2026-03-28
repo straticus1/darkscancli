@@ -23,6 +23,7 @@ import (
 	"github.com/afterdarksys/darkscan/pkg/license"
 	"github.com/afterdarksys/darkscan/pkg/quarantine"
 	"github.com/afterdarksys/darkscan/pkg/scanner"
+	"github.com/afterdarksys/darkscan/pkg/sandbox"
 	"github.com/afterdarksys/darkscan/pkg/store"
 	"github.com/afterdarksys/darkscan/pkg/vfs/local"
 	"github.com/afterdarksys/darkscan/pkg/vfs/nfs"
@@ -47,6 +48,7 @@ var (
 	enableViper       bool
 	enableDocument    bool
 	enableHeuristics  bool
+	enableSandbox     bool
 	autoQuarantine    bool
 	yaraRulesPath     string
 	capaRulesPath     string
@@ -123,6 +125,7 @@ func init() {
 	scanCmd.Flags().BoolVar(&enableViper, "viper", false, "Enable Viper engine")
 	scanCmd.Flags().BoolVar(&enableDocument, "document", true, "Enable Document parsing engine")
 	scanCmd.Flags().BoolVar(&enableHeuristics, "heuristics", true, "Enable Heuristics engine")
+	scanCmd.Flags().BoolVar(&enableSandbox, "sandbox", true, "Enable Unicorn Sandbox engine")
 	scanCmd.Flags().BoolVarP(&autoQuarantine, "quarantine", "q", false, "Automatically quarantine infected files")
 	scanCmd.Flags().StringVar(&yaraRulesPath, "yara-rules", "", "Path to YARA rules")
 	scanCmd.Flags().StringVar(&capaRulesPath, "capa-rules", "", "Path to CAPA rules")
@@ -236,7 +239,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		connectTimeout = 3 * time.Second
 	}
 
-	dsClient, daemonErr := client.NewClient(daemonURL, "", requestTimeout, connectTimeout)
+	dsClient, daemonErr := client.NewClient(daemonURL, "", cfg.Daemon.DaemonToken, requestTimeout, connectTimeout)
 	if daemonErr == nil && dsClient != nil {
 		if verbose {
 			fmt.Println("Connected to DarkScan daemon, routing scan request...")
@@ -399,6 +402,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 		heuristicsEngine := heuristics.New()
 		s.RegisterEngine(heuristicsEngine)
 		defer heuristicsEngine.Close()
+	}
+
+	if enableSandbox && cfg.Sandbox.Enabled {
+		if verbose {
+			fmt.Println("Initializing Unicorn Sandbox engine...")
+		}
+		sandboxEngine := sandbox.New()
+		s.RegisterEngine(sandboxEngine)
+		defer sandboxEngine.Close()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -760,7 +772,7 @@ func runDaemonStatus(cmd *cobra.Command, args []string) error {
 		connectTimeout = 3 * time.Second
 	}
 
-	dsClient, err := client.NewClient(cfg.Daemon.DaemonEndpoint, "", requestTimeout, connectTimeout)
+	dsClient, err := client.NewClient(cfg.Daemon.DaemonEndpoint, "", cfg.Daemon.DaemonToken, requestTimeout, connectTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon: %w", err)
 	}
@@ -810,7 +822,7 @@ func runDaemonUpdate(cmd *cobra.Command, args []string) error {
 		connectTimeout = 3 * time.Second
 	}
 
-	dsClient, err := client.NewClient(cfg.Daemon.DaemonEndpoint, "", requestTimeout, connectTimeout)
+	dsClient, err := client.NewClient(cfg.Daemon.DaemonEndpoint, "", cfg.Daemon.DaemonToken, requestTimeout, connectTimeout)
 	if err != nil {
 		return fmt.Errorf("failed to connect to daemon: %w", err)
 	}

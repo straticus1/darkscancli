@@ -3,6 +3,7 @@ package document
 import (
 	"archive/zip"
 	"context"
+	"io"
 	"os"
 	"strings"
 
@@ -193,6 +194,10 @@ func (e *DocumentEngine) scanOfficeOLE(path string, res *scanner.ScanResult) (*s
 	}
 
 	return res, nil
+}
+
+func (e *DocumentEngine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
+	return scanner.ScanReaderToTemp(ctx, r, name, e.Scan)
 }
 
 func (e *DocumentEngine) Update(ctx context.Context) error {

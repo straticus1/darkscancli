@@ -16,6 +16,11 @@ type Config struct {
 	FileHashes FileHashesConfig `json:"filehashes"`
 	Scan       ScanConfig       `json:"scan"`
 	Daemon     DaemonConfig     `json:"daemon"`
+	Sandbox    SandboxConfig    `json:"sandbox"`
+}
+
+type SandboxConfig struct {
+	Enabled bool `json:"enabled"`
 }
 
 type DaemonConfig struct {
@@ -24,6 +29,7 @@ type DaemonConfig struct {
 	RequestTimeout  string `json:"request_timeout"`   // Default: "1h"
 	ConnectTimeout  string `json:"connect_timeout"`   // Default: "3s"
 	MaxUploadSizeMB int    `json:"max_upload_size_mb"` // Default: 500
+	DaemonToken     string `json:"daemon_token"`       // Bearer token
 }
 
 type ClamAVConfig struct {
@@ -137,6 +143,10 @@ func DefaultConfig() *Config {
 			RequestTimeout:  "1h",
 			ConnectTimeout:  "3s",
 			MaxUploadSizeMB: 500,
+			DaemonToken:     "",
+		},
+		Sandbox: SandboxConfig{
+			Enabled: true,
 		},
 	}
 }

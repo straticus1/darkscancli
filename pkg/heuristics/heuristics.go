@@ -2,6 +2,7 @@ package heuristics
 
 import (
 	"context"
+	"io"
 
 	"github.com/afterdarksys/darkscan/pkg/forensics"
 	"github.com/afterdarksys/darkscan/pkg/scanner"
@@ -78,6 +79,10 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 		Threats:    threats,
 		ScanEngine: e.Name(),
 	}, nil
+}
+
+func (e *Engine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
+	return scanner.ScanReaderToTemp(ctx, r, name, e.Scan)
 }
 
 func (e *Engine) Update(ctx context.Context) error {

@@ -12,6 +12,7 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -124,6 +125,10 @@ func (e *Engine) Scan(ctx context.Context, path string) (*scanner.ScanResult, er
 	default:
 		return result, fmt.Errorf("scan error: %s", C.GoString(C.cl_strerror(ret)))
 	}
+}
+
+func (e *Engine) ScanReader(ctx context.Context, r io.Reader, name string) (*scanner.ScanResult, error) {
+	return scanner.ScanReaderToTemp(ctx, r, name, e.Scan)
 }
 
 func (e *Engine) Update(ctx context.Context) error {

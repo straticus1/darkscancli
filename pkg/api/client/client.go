@@ -12,16 +12,36 @@ import (
 
 	"github.com/afterdarksys/darkscan/pkg/api/server"
 	"github.com/afterdarksys/darkscan/pkg/scanner"
+	"github.com/afterdarksys/darkscan/pkg/stego"
+	"github.com/afterdarksys/darkscan/pkg/store"
 )
 
 type Client struct {
 	httpClient *http.Client
 	baseURL    string // Can be unix:// or http://
+	authToken  string
+}
+
+// authTransport is an http.RoundTripper that injects the authorization token
+type authTransport struct {
+	transport http.RoundTripper
+	token     string
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.token != "" {
+		req.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	tr := t.transport
+	if tr == nil {
+		tr = http.DefaultTransport
+	}
+	return tr.RoundTrip(req)
 }
 
 // NewClient attempts to discover a daemon.
 // It returns a non-nil client if a daemon is found and responsive.
-func NewClient(configDaemonURL string, unixSocket string, requestTimeout, connectTimeout time.Duration) (*Client, error) {
+func NewClient(configDaemonURL string, unixSocket string, authToken string, requestTimeout, connectTimeout time.Duration) (*Client, error) {
 	if requestTimeout == 0 {
 		requestTimeout = 1 * time.Hour
 	}
@@ -31,11 +51,15 @@ func NewClient(configDaemonURL string, unixSocket string, requestTimeout, connec
 
 	// Try config daemon first
 	if configDaemonURL != "" {
-		httpClient := &http.Client{Timeout: requestTimeout}
-		if checkHealth(configDaemonURL, connectTimeout) {
+		httpClient := &http.Client{
+			Transport: &authTransport{token: authToken},
+			Timeout:   requestTimeout,
+		}
+		if checkHealth(configDaemonURL, authToken, connectTimeout) {
 			return &Client{
 				baseURL:    configDaemonURL,
 				httpClient: httpClient,
+				authToken:  authToken,
 			}, nil
 		}
 	}
@@ -53,15 +77,16 @@ func NewClient(configDaemonURL string, unixSocket string, requestTimeout, connec
 		}
 
 		unixClient := &http.Client{
-			Transport: transport,
+			Transport: &authTransport{transport: transport, token: authToken},
 			Timeout:   requestTimeout,
 		}
 
 		// Use http://localhost as a dummy host since transport overwrites it anyway
-		if checkHealth("http://localhost", connectTimeout) {
+		if checkHealth("http://localhost", authToken, connectTimeout) {
 			return &Client{
 				baseURL:    "http://localhost",
 				httpClient: unixClient,
+				authToken:  authToken,
 			}, nil
 		}
 	}
@@ -69,8 +94,11 @@ func NewClient(configDaemonURL string, unixSocket string, requestTimeout, connec
 	return nil, fmt.Errorf("no darkscand daemon discovered at %s or unix:%s", configDaemonURL, unixSocket)
 }
 
-func checkHealth(url string, timeout time.Duration) bool {
-	httpClient := &http.Client{Timeout: timeout}
+func checkHealth(url string, token string, timeout time.Duration) bool {
+	httpClient := &http.Client{
+		Transport: &authTransport{token: token},
+		Timeout:   timeout,
+	}
 	resp, err := httpClient.Get(url + "/ping")
 	if err != nil {
 		return false
@@ -161,6 +189,101 @@ func (c *Client) TriggerUpdate() error {
 
 	if !updateResp.Success {
 		return fmt.Errorf("update failed: %s", updateResp.Error)
+	}
+
+	return nil
+}
+
+// AnalyzeStego analyzes a file for steganography via the daemon
+func (c *Client) AnalyzeStego(path string) (*stego.Analysis, error) {
+	reqBody := server.StegoAnalyzeRequest{
+		Path: path,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := c.httpClient.Post(c.baseURL+"/stego/analyze", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, fmt.Errorf("daemon connection error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var stegoResp server.StegoAnalyzeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stegoResp); err != nil {
+		return nil, fmt.Errorf("failed to decode daemon response: %w", err)
+	}
+
+	if !stegoResp.Success {
+		return nil, fmt.Errorf("daemon returned error: %s", stegoResp.Error)
+	}
+
+	return stegoResp.Analysis, nil
+}
+
+// CheckHash queries the daemon's HashStore for previously seen file hashes
+func (c *Client) CheckHash(sha256 string) (*store.HashCacheEntry, bool, error) {
+	reqBody := server.HashCheckRequest{
+		SHA256: sha256,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := c.httpClient.Post(c.baseURL+"/hashstore/check", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, false, fmt.Errorf("daemon connection error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotImplemented {
+		return nil, false, fmt.Errorf("daemon does not have hashstore configured")
+	}
+
+	var hashResp server.HashCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hashResp); err != nil {
+		return nil, false, fmt.Errorf("failed to decode daemon response: %w", err)
+	}
+
+	if !hashResp.Success {
+		return nil, false, fmt.Errorf("daemon returned error: %s", hashResp.Error)
+	}
+
+	return hashResp.Entry, hashResp.Found, nil
+}
+
+// UpdateHashCache tells the daemon to cache a scan result
+func (c *Client) UpdateHashCache(entry store.HashCacheEntry) error {
+	reqBody := server.HashUpdateRequest{
+		Entry: entry,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := c.httpClient.Post(c.baseURL+"/hashstore/update", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("daemon connection error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotImplemented {
+		return fmt.Errorf("daemon does not have hashstore configured")
+	}
+
+	var hashResp server.HashUpdateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hashResp); err != nil {
+		return fmt.Errorf("failed to decode daemon response: %w", err)
+	}
+
+	if !hashResp.Success {
+		return fmt.Errorf("daemon returned error: %s", hashResp.Error)
 	}
 
 	return nil
